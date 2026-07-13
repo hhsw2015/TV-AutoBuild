@@ -1,0 +1,288 @@
+name: Monitor sources and build APKs
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: Build even when the four source SHAs are unchanged
+        required: true
+        type: boolean
+        default: true
+  repository_dispatch:
+    types: [source-updated, rebuild]
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+      - "config/**"
+      - "scripts/**"
+      - "README.md"
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: tv-autobuild
+  cancel-in-progress: false
+
+env:
+  NDK_VERSION: 28.2.13676358
+
+jobs:
+  resolve:
+    name: Detect source changes
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.sources.outputs.should_build }}
+      source_changed: ${{ steps.sources.outputs.source_changed }}
+      changed_sources: ${{ steps.sources.outputs.changed_sources }}
+      tv_sha: ${{ steps.sources.outputs.tv_sha }}
+      media_sha: ${{ steps.sources.outputs.media_sha }}
+      vivid_sha: ${{ steps.sources.outputs.vivid_sha }}
+      sherpa_sha: ${{ steps.sources.outputs.sherpa_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Resolve all source branches
+        id: sources
+        env:
+          FORCE_REQUESTED: ${{ github.event_name == 'push' || github.event_name == 'repository_dispatch' || (github.event_name == 'workflow_dispatch' && inputs.force_build) }}
+        run: scripts/resolve-sources.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source-refs
+          path: build/source-refs.json
+          retention-days: 30
+
+      - name: Monitoring summary
+        run: |
+          {
+            echo "## Source monitor"
+            echo "- Changed: ${{ steps.sources.outputs.source_changed }}"
+            echo "- Changed repositories: ${{ steps.sources.outputs.changed_sources }}"
+            echo "- Build scheduled: ${{ steps.sources.outputs.should_build }}"
+            echo '```json'
+            cat build/source-refs.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build signed Mobile and Leanback APKs
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout autobuild repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Download resolved source manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: source-refs
+          path: build
+
+      - name: Checkout TV
+        uses: actions/checkout@v4
+        with:
+          repository: iptvorganization/TV
+          ref: ${{ needs.resolve.outputs.tv_sha }}
+          path: sources/TV
+          persist-credentials: false
+
+      - name: Checkout media
+        uses: actions/checkout@v4
+        with:
+          repository: iptvorganization/media
+          ref: ${{ needs.resolve.outputs.media_sha }}
+          path: sources/FongMi-media
+          persist-credentials: false
+
+      - name: Checkout VividLib
+        uses: actions/checkout@v4
+        with:
+          repository: iptvorganization/VividLib
+          ref: ${{ needs.resolve.outputs.vivid_sha }}
+          path: sources/VividLib
+          persist-credentials: false
+
+      - name: Checkout sherpa-onnx
+        uses: actions/checkout@v4
+        with:
+          repository: iptvorganization/sherpa-onnx
+          ref: ${{ needs.resolve.outputs.sherpa_sha }}
+          path: sources/sherpa-onnx
+          persist-credentials: false
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+          cache-dependency-path: |
+            sources/TV/**/*.gradle*
+            sources/TV/gradle/libs.versions.toml
+            sources/FongMi-media/**/*.gradle*
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-37" \
+            "build-tools;37.0.0" \
+            "ndk;${NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Restore source-built sherpa runtime
+        id: sherpa-cache
+        uses: actions/cache@v4
+        with:
+          path: runtime-cache/sherpa
+          key: sherpa-android-static-${{ needs.resolve.outputs.sherpa_sha }}-ndk-${{ env.NDK_VERSION }}
+
+      - name: Build sherpa-onnx Java and JNI runtime
+        if: steps.sherpa-cache.outputs.cache-hit != 'true'
+        working-directory: sources/sherpa-onnx
+        env:
+          BUILD_SHARED_LIBS: "OFF"
+          SHERPA_ONNX_ENABLE_TTS: "OFF"
+          SHERPA_ONNX_ENABLE_SPEAKER_DIARIZATION: "OFF"
+          SHERPA_ONNX_ENABLE_BINARY: "OFF"
+          SHERPA_ONNX_ENABLE_C_API: "OFF"
+          SHERPA_ONNX_ENABLE_RKNN: "OFF"
+          SHERPA_ONNX_ENABLE_QNN: "OFF"
+        run: |
+          export ANDROID_NDK="${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}"
+          ./build-android-arm64-v8a.sh
+          ./build-android-armv7-eabi.sh
+          make -C sherpa-onnx/java-api clean all
+          mkdir -p "$GITHUB_WORKSPACE/runtime-cache/sherpa/arm64-v8a"
+          mkdir -p "$GITHUB_WORKSPACE/runtime-cache/sherpa/armeabi-v7a"
+          cp sherpa-onnx/java-api/build/sherpa-onnx.jar "$GITHUB_WORKSPACE/runtime-cache/sherpa/sherpa-onnx.jar"
+          cp build-android-arm64-v8a-static/install/lib/libsherpa-onnx-jni.so "$GITHUB_WORKSPACE/runtime-cache/sherpa/arm64-v8a/"
+          cp build-android-armv7-eabi-static/install/lib/libsherpa-onnx-jni.so "$GITHUB_WORKSPACE/runtime-cache/sherpa/armeabi-v7a/"
+
+      - name: Install source-built sherpa runtime into TV
+        run: |
+          test -s runtime-cache/sherpa/sherpa-onnx.jar
+          test -s runtime-cache/sherpa/arm64-v8a/libsherpa-onnx-jni.so
+          test -s runtime-cache/sherpa/armeabi-v7a/libsherpa-onnx-jni.so
+          install -m 644 runtime-cache/sherpa/sherpa-onnx.jar sources/TV/app/libs/sherpa-onnx-v1.13.4.jar
+          install -m 755 runtime-cache/sherpa/arm64-v8a/libsherpa-onnx-jni.so sources/TV/app/src/main/jniLibs/arm64-v8a/libsherpa-onnx-jni.so
+          install -m 755 runtime-cache/sherpa/armeabi-v7a/libsherpa-onnx-jni.so sources/TV/app/src/main/jniLibs/armeabi-v7a/libsherpa-onnx-jni.so
+
+      - name: Build AV3A JNI from latest VividLib source
+        env:
+          MEDIA3_DIR: ${{ github.workspace }}/sources/FongMi-media
+          VIVID_SOURCE_DIR: ${{ github.workspace }}/sources/VividLib
+          VIVID_COMMIT: ${{ needs.resolve.outputs.vivid_sha }}
+        run: |
+          export NDK="${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}"
+          sources/TV/tools/build-av3a-from-source.sh
+
+      - name: Configure persistent autobuild signing
+        working-directory: sources/TV
+        env:
+          KEYSTORE_B64: ${{ secrets.AUTOBUILD_KEYSTORE_B64 }}
+          STORE_PASSWORD: ${{ secrets.AUTOBUILD_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.AUTOBUILD_KEY_PASSWORD }}
+        run: |
+          test -n "$KEYSTORE_B64"
+          test -n "$STORE_PASSWORD"
+          test -n "$KEY_PASSWORD"
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > autobuild.keystore
+          cat > local.properties <<EOF_PROPERTIES
+          sdk.dir=${ANDROID_SDK_ROOT}
+          storeFile=../autobuild.keystore
+          keyAlias=autobuild
+          storePassword=${STORE_PASSWORD}
+          keyPassword=${KEY_PASSWORD}
+          EOF_PROPERTIES
+
+      - name: Run tests and build release APKs
+        working-directory: sources/TV
+        run: |
+          ./gradlew --no-daemon --stacktrace \
+            :app:testLeanbackArmeabi_v7aDebugUnitTest \
+            :app:testMobileArm64_v8aDebugUnitTest \
+            :app:assembleLeanbackArmeabi_v7aRelease \
+            :app:assembleMobileArm64_v8aRelease
+
+      - name: Verify signatures and prepare release
+        id: release
+        env:
+          TV_DIR: ${{ github.workspace }}/sources/TV
+          SOURCE_REFS: ${{ github.workspace }}/build/source-refs.json
+        run: |
+          APKSIGNER=$(find "$ANDROID_SDK_ROOT/build-tools" -type f -name apksigner | sort -V | tail -1)
+          test -x "$APKSIGNER"
+          scripts/prepare-release.sh
+          "$APKSIGNER" verify --verbose --print-certs dist/TV-leanback-armeabi-v7a.apk
+          "$APKSIGNER" verify --verbose --print-certs dist/TV-mobile-arm64-v8a.apk
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: TV-APKs-${{ github.run_number }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: autobuild-${{ github.run_number }}
+          name: ${{ steps.release.outputs.release_name }}
+          body_path: dist/RELEASE_NOTES.md
+          make_latest: true
+          files: |
+            dist/TV-leanback-armeabi-v7a.apk
+            dist/TV-mobile-arm64-v8a.apk
+            dist/SOURCE_REFS.json
+            dist/SHA256SUMS.txt
+
+  record:
+    name: Record monitored source state
+    needs: [resolve, build]
+    if: always() && needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download resolved source manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: source-refs
+          path: build
+
+      - name: Commit attempt state
+        env:
+          SOURCE_REFS: ${{ github.workspace }}/build/source-refs.json
+          BUILD_RESULT: ${{ needs.build.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          git pull --rebase origin main
+          scripts/record-state.sh
+          git config user.name iptvorganization
+          git config user.email iptvorganization@users.noreply.github.com
+          git add state/
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "chore: record source build ${GITHUB_RUN_NUMBER} (${BUILD_RESULT})"
+          git push origin HEAD:main

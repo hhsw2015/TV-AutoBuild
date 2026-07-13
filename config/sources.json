@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "sources": {
+    "TV": {
+      "repository": "iptvorganization/TV",
+      "branch": "fongmi"
+    },
+    "media": {
+      "repository": "iptvorganization/media",
+      "branch": "codec-support"
+    },
+    "VividLib": {
+      "repository": "iptvorganization/VividLib",
+      "branch": "master"
+    },
+    "sherpa-onnx": {
+      "repository": "iptvorganization/sherpa-onnx",
+      "branch": "master"
+    }
+  }
+}
