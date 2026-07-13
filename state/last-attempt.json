@@ -1,4 +1,25 @@
 {
   "schema": 1,
-  "sources": {}
+  "sources": {
+    "TV": {
+      "repository": "iptvorganization/TV",
+      "branch": "fongmi",
+      "sha": "abab1cf755b3453c19d9c0aaa5c8b8e31864f71f"
+    },
+    "media": {
+      "repository": "iptvorganization/media",
+      "branch": "codec-support",
+      "sha": "c00ce6aa0ad070a8265af50e4cc995bcf698fe6c"
+    },
+    "VividLib": {
+      "repository": "iptvorganization/VividLib",
+      "branch": "master",
+      "sha": "10a5c7140a15f179a7d94fbff76f9176063f7a97"
+    },
+    "sherpa-onnx": {
+      "repository": "iptvorganization/sherpa-onnx",
+      "branch": "master",
+      "sha": "40b75e98a0cd5b3f961e73ae158305b3447b5ebb"
+    }
+  }
 }
